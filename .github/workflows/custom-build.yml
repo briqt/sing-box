@@ -1,0 +1,99 @@
+name: Build with v2ray_api
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 1.13.13), leave empty for latest upstream'
+        required: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VER="${{ inputs.version }}"
+          else
+            VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+          fi
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          HTTP=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://api.github.com/repos/briqt/sing-box/releases/tags/v${VER}")
+          if [ "$HTTP" = "200" ]; then
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "v$VER already exists, skipping"
+          else
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Will build v$VER"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box
+          ref: v${{ needs.check.outputs.version }}
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '~1.24'
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VER="${{ needs.check.outputs.version }}"
+          TAGS="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_v2ray_api,with_tailscale"
+          go build -v -trimpath -tags "$TAGS" \
+            -ldflags "-s -w -X 'github.com/sagernet/sing-box/constant.Version=${VER}'" \
+            -o sing-box ./cmd/sing-box
+          tar czf "sing-box-${VER}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" sing-box
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "*.tar.gz"
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check.outputs.version }}
+          name: v${{ needs.check.outputs.version }}
+          body: |
+            sing-box v${{ needs.check.outputs.version }} built with `with_v2ray_api` tag.
+
+            Build tags: `with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_v2ray_api,with_tailscale`
+
+            Upstream release: https://github.com/SagerNet/sing-box/releases/tag/v${{ needs.check.outputs.version }}
+          files: "*.tar.gz"
